@@ -12,7 +12,8 @@ from keras.activations import relu, sigmoid, softmax
 from keras.backend import squeeze
 import keras.backend as K
 from keras.utils import to_categorical
-from keras.callbacks import ModelCheckpoint
+from keras.callbacks import ModelCheckpoint, EarlyStopping
+from sklearn import metrics
 
 char_list = string.ascii_letters+string.digits
 
@@ -46,19 +47,24 @@ i = 1
 flag = 0
 path = 'ocr'
 
+width, height = 400, 32
+
 for root, dirnames, filenames in os.walk(path):
     for f_name in fnmatch.filter(filenames, '*.jpg'):
         img = np.array(load_img(os.path.join(root, f_name), color_mode='grayscale'))
-    
+        # img = 255 - img # invert image
+
         # convert each image of shape (50, 500, 1)
-        w, h = img.shape
-        if h > 500 or w > 50:
+        # w, h = img.shape
+        h, w = img.shape
+        if h > height or w > width:
+            print(f_name, img.shape)
             continue
-        if w < 50:
-            add_zeros = np.ones((50-w, h))*255
+        if h < height:
+            add_zeros = np.ones((height-h, w))*255
             img = np.concatenate((img, add_zeros))
-        if h < 500:
-            add_zeros = np.ones((w, 500-h))*255
+        if w < width:
+            add_zeros = np.ones((height, width-w))*255
             img = np.concatenate((img, add_zeros), axis=1)
         img = np.expand_dims(img, axis = 2)
 
@@ -135,9 +141,9 @@ from matplotlib import pyplot
 # model.add(Dense(100, activation='relu'))
 # model.add(Dense(n_outputs, activation='softmax'))
 
-# input with shape of height=32 and width=128 
-inputs = Input(shape=(50,500,1))
- 
+# input with shape of height=32 and width=200
+inputs = Input(shape=(height,width,1))
+
 # convolution layer with kernel size (3,3)
 conv_1 = Conv2D(64, (3,3), activation = 'relu', padding='same')(inputs)
 # poolig layer with kernel size (2,2)
@@ -148,19 +154,19 @@ pool_2 = MaxPool2D(pool_size=(2, 2), strides=2)(conv_2)
  
 conv_3 = Conv2D(256, (3,3), activation = 'relu', padding='same')(pool_2)
  
-# conv_4 = Conv2D(256, (3,3), activation = 'relu', padding='same')(conv_3)
+conv_4 = Conv2D(256, (3,3), activation = 'relu', padding='same')(conv_3)
 # poolig layer with kernel size (2,1)
-pool_4 = MaxPool2D(pool_size=(2, 1))(conv_3)
+pool_4 = MaxPool2D(pool_size=(2, 1))(conv_4)
  
 conv_5 = Conv2D(512, (3,3), activation = 'relu', padding='same')(pool_4)
 # Batch normalization layer
 batch_norm_5 = BatchNormalization()(conv_5)
  
-# conv_6 = Conv2D(512, (3,3), activation = 'relu', padding='same')(batch_norm_5)
-# batch_norm_6 = BatchNormalization()(conv_6)
-pool_6 = MaxPool2D(pool_size=(2, 1))(batch_norm_5)
+conv_6 = Conv2D(512, (3,3), activation = 'relu', padding='same')(batch_norm_5)
+batch_norm_6 = BatchNormalization()(conv_6)
+pool_6 = MaxPool2D(pool_size=(2, 1))(batch_norm_6)
  
-conv_7 = Conv2D(512, (3,2), activation = 'relu')(pool_6)
+conv_7 = Conv2D(512, (2,2), activation = 'relu')(pool_6)
  
 squeezed = Lambda(lambda x: K.squeeze(x, 1))(conv_7)
 
@@ -176,11 +182,13 @@ act_model = Model(inputs, outputs)
 labels = Input(name='the_labels', shape=[max_label_len], dtype='float32')
 input_length = Input(name='input_length', shape=[1], dtype='int64')
 label_length = Input(name='label_length', shape=[1], dtype='int64')
- 
- 
+
+
 def ctc_lambda_func(args):
     y_pred, labels, input_length, label_length = args
- 
+    # the 2 is critical here since the first couple outputs of the RNN
+    # tend to be garbage:
+    # y_pred = y_pred[:, 2:, :]
     return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
 
  
@@ -191,12 +199,13 @@ model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer = 'adam')
  
 filepath="best_model.hdf5"
 checkpoint = ModelCheckpoint(filepath=filepath, monitor='val_loss', verbose=1, save_best_only=True, mode='auto')
-callbacks_list = [checkpoint]
+early = EarlyStopping(monitor='loss', min_delta=0.001, patience=3, mode='auto')
+callbacks_list = [early, checkpoint]
 
 training_img = np.array(training_img)
 train_input_length = np.array(train_input_length)
 train_label_length = np.array(train_label_length)
- 
+
 valid_img = np.array(valid_img)
 valid_input_length = np.array(valid_input_length)
 valid_label_length = np.array(valid_label_length)
@@ -205,10 +214,37 @@ model.summary()
 
 model.fit(
     x=[training_img, train_padded_txt, train_input_length, train_label_length], 
-    y=np.zeros(18000), 
+    y=np.zeros(45000), 
     batch_size=256, 
-    epochs = 20, 
+    epochs = 100, 
     validation_data = ([valid_img, valid_padded_txt, valid_input_length, valid_label_length], [np.zeros(2000)]), 
     verbose = 1, 
     callbacks = callbacks_list
 )
+
+# load the saved best model weights
+act_model.load_weights('best_model.hdf5')
+
+# predict outputs on validation images
+prediction = act_model.predict(valid_img)
+
+# use CTC decoder
+out = K.get_value(K.ctc_decode(prediction, input_length=np.ones(prediction.shape[0])*prediction.shape[1],
+                         greedy=True)[0][0])
+
+# see the results
+i = 0
+for x in out:
+    print(valid_orig_txt[i])
+    for p in x:  
+        if int(p) != -1:
+            print(char_list[int(p)], end = '')       
+    print('\n')
+    i+=1
+
+text_len = 10
+
+valid_padded_txt[valid_padded_txt == 62] = -1
+eval_valid_padded_txt = np.sum(valid_padded_txt[:, :text_len], axis=1)
+eval_out = np.sum(out[:, :text_len], axis=1)
+print("Accuracy:", metrics.accuracy_score(eval_valid_padded_txt, eval_out))
